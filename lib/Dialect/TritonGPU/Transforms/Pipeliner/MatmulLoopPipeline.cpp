@@ -584,6 +584,20 @@ createSchedule(scf::ForOp forOp, int numStages, bool prefetchExtract) {
     }
   }
 
+  DenseSet<Operation *> adds;
+  for (auto *op : stage1deps) {
+    SetVector<Operation *> forwardSlice;
+    mlir::getForwardSlice(op, &forwardSlice);
+    for (auto *slice : forwardSlice) {
+      if (!isa<scf::YieldOp>(slice) && !insertAndDeps.contains(slice) && !stage1deps.contains(slice)) {
+        adds.insert(slice);
+      }
+    }
+  }
+  for (auto *add : adds) {
+    stage1deps.insert(add);
+  }
+
   DenseSet<Operation *> extractAndDeps;
   for (Operation *op : extractOps) {
     addDep(op, extractAndDeps, true, &insertAndDeps);
@@ -591,8 +605,7 @@ createSchedule(scf::ForOp forOp, int numStages, bool prefetchExtract) {
   std::vector<std::pair<Operation *, unsigned>> schedule;
   // Schedule stage `numStage - 1` first.
   addOps(forOp, numStages - 1, schedule, [&](Operation *op) {
-    return insertAndDeps.count(op) == 0 && stage1deps.count(op) == 0 &&
-           extractAndDeps.count(op) == 0;
+    return insertAndDeps.count(op) == 0 && stage1deps.count(op) == 0 && extractAndDeps.count(op) == 0;
   });
 
   // Schedule some dependencies with distance of 1 into stage 1 to reduce
