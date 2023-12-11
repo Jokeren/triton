@@ -42,7 +42,7 @@ static void createAsyncCopy(scf::ForOp &forOp, tt::LoadOp loadOp, Value alloc,
   auto insertOp = builder.create<ttg::InsertSliceAsyncOp>(
       loc, alloc.getType(), loadOp.getPtr(), alloc, insertIdx, loadOp.getMask(),
       loadOp.getOther(), loadOp.getCache(), loadOp.getEvict(),
-      loadOp.getIsVolatile(), /*axis*/ 0);
+      loadOp.getIsVolatile(), /*isAsync=*/true, /*axis=*/0);
   auto commmit = builder.create<ttg::AsyncCommitGroupOp>(loc);
 
   // Extract part.

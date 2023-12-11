@@ -213,7 +213,7 @@ int applyCommit(OpBuilder &builder, ttng::ProducerCommitOp &op,
             /*index=*/insertOp.getIndex(),
             /*mask=*/insertOp.getMask(), /*other=*/insertOp.getOther(),
             /*cache=*/insertOp.getCache(), /*evict=*/insertOp.getEvict(),
-            /*isVolatile=*/insertOp.getIsVolatile(),
+            /*isVolatile=*/insertOp.getIsVolatile(), /*isAsync=*/true,
             /*axis=*/insertOp.getAxis());
         insertOp.getResult().replaceAllUsesWith(newSliceOp.getResult());
         setAgentIds(newSliceOp, agentIds);

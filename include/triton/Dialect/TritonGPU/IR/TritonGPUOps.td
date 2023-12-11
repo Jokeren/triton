@@ -280,11 +280,19 @@ def TTG_InsertSliceAsyncOp : TTG_Op<"insert_slice_async",
               values are inserted into the `$dst` tensor if the corresponding
               element of the `$mask` tensor is false.
 
-      In the future, we may decompose this operation into a sequence of:
+      insert_slice has two modes up to the type of src:
+      
+      - mode 1: ptr/src is a tensor of pointers.
 
-      * `async` operation to specify a sequence of asynchronous operations
-      * `load` operation to load a tensor from global memory
-      * `insert_slice` operations to insert the `$src` tensor into the `$dst` tensor
+        * LDGSTS=Yes  : tt.load -(Coalesce)-(Pipeline)-> ttgpu.insert_slice {async = true}
+        * LDGSTS=No   : tt.load -(Coalesce)-(Pipeline)-(Decompose)-> ttgpu.insert_slice {async = false}
+
+      - mode 2: ptr/src is a tensor pointer
+
+        * LDGSTS=Yes, TMA=No : tt.load -(Coalesce)-(RewriteTensorPointer)-(Pipeline)-> ttgpu.insert_slice {async = true}
+        * LDGSTS=No, TMA=No  : tt.load -(Coalesce)-(RewriteTensorPointer)-(Pipeline)-(Decompose)-> ttgpu.insert_slice {async = false}
+        * TMA=Yes            : tt.load -(Coalesce)-(Pipeline)-> ttgpu.insert_slice {async = true} -(MaterializeLoad)-> ttnvgpu.insert_slice_async
+        * TMA=Yes            : tt.load -(Coalesce)-(MaterializeLoad)-> ttnvgpu.insert_slice_async
 
       Example:
 
@@ -298,19 +306,22 @@ def TTG_InsertSliceAsyncOp : TTG_Op<"insert_slice_async",
   let arguments = (ins TT_PtrLike:$src, TT_Tensor:$dst, I32:$index,
                        Optional<I1Tensor>:$mask, Optional<TT_Type>:$other,
                        TT_CacheModifierAttr:$cache, TT_EvictionPolicyAttr:$evict,
-                       BoolAttr:$isVolatile, I32Attr:$axis);
+                       BoolAttr:$isVolatile, BoolAttr:$isAsync, I32Attr:$axis);
 
   let builders = [
       OpBuilder<(ins "Value":$src, "Value":$dst, "Value":$index,
                      "triton::CacheModifier":$cache,
-                     "triton::EvictionPolicy":$evict, "bool":$isVolatile, "int":$axis)>,
+                     "triton::EvictionPolicy":$evict,
+                     "bool":$isVolatile, "bool":$isAsync, "int":$axis)>,
       OpBuilder<(ins "Value":$src, "Value":$dst, "Value":$index, "Value":$mask,
                      "triton::CacheModifier":$cache,
-                     "triton::EvictionPolicy":$evict, "bool":$isVolatile, "int":$axis)>,
+                     "triton::EvictionPolicy":$evict,
+                     "bool":$isVolatile, "bool":$isAsync, "int":$axis)>,
       OpBuilder<(ins "Value":$src, "Value":$dst, "Value":$index,
                      "Value":$mask, "Value":$other,
                      "triton::CacheModifier":$cache,
-                     "triton::EvictionPolicy":$evict, "bool":$isVolatile, "int":$axis)>,
+                     "triton::EvictionPolicy":$evict,
+                     "bool":$isVolatile, "bool":$isAsync, "int":$axis)>,
   ];
 
   let results = (outs TT_Tensor:$result);

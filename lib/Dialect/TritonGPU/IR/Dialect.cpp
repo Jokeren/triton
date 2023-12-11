@@ -1779,7 +1779,7 @@ struct CanonicalizeConvertFromConvert
           insert_slice.getIndex(), insert_slice.getMask(),
           insert_slice.getOther(), insert_slice.getCache(),
           insert_slice.getEvict(), insert_slice.getIsVolatile(),
-          insert_slice.getAxis());
+          insert_slice.getIsAsync(), insert_slice.getAxis());
       return mlir::success();
     }
     // cvt(extract_slice(x), type2) -> extract_slice(cvt(x, type2))
