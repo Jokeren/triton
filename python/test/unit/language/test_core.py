@@ -3409,6 +3409,11 @@ def _sum_combine(a, b):
     return a + b
 
 
+@triton.jit
+def _tuple_sum_combine(lhs0, lhs1, rhs0, rhs1):
+    return lhs0 + rhs0, lhs1 + rhs1
+
+
 @pytest.mark.interpreter
 def test_generic_reduction(device):
 
@@ -3444,6 +3449,38 @@ def test_generic_reduction(device):
     torch.testing.assert_close(out_var, expect_var)
     torch.testing.assert_close(sum0, sum_ref)
     torch.testing.assert_close(sum1, sum_ref)
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("keep_dims", [False, True])
+def test_generic_tuple_reduction_axis_none(keep_dims, device):
+
+    @triton.jit
+    def kernel(X, Y, out_x, out_y, KEEP_DIMS: tl.constexpr):
+        offsets = tl.arange(0, 8)
+        x = tl.load(X + offsets).reshape((2, 4))
+        y = tl.load(Y + offsets).reshape((2, 4))
+        sum_x, sum_y = tl.reduce((x, y), axis=None, combine_fn=_tuple_sum_combine, keep_dims=KEEP_DIMS)
+        if KEEP_DIMS:
+            tl.static_assert(sum_x.shape == [1, 1])
+            tl.static_assert(sum_y.shape == [1, 1])
+            out_x = out_x[None, None]
+            out_y = out_y[None, None]
+        else:
+            tl.static_assert(sum_x.shape == [])
+            tl.static_assert(sum_y.shape == [])
+        tl.store(out_x, sum_x)
+        tl.store(out_y, sum_y)
+
+    x = torch.arange(8, dtype=torch.float32, device=device)
+    y = torch.arange(8, dtype=torch.float32, device=device) + 10
+    out_x = torch.empty((), dtype=torch.float32, device=device)
+    out_y = torch.empty((), dtype=torch.float32, device=device)
+
+    kernel[(1, )](x, y, out_x, out_y, KEEP_DIMS=keep_dims)
+
+    torch.testing.assert_close(out_x, x.sum())
+    torch.testing.assert_close(out_y, y.sum())
 
 
 # ---------------
