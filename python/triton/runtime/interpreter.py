@@ -643,14 +643,16 @@ class InterpreterBuilder:
 
     def create_umulhi(self, lhs, rhs):
         dtype = lhs.data.dtype
-        if dtype == np.int64 or dtype == np.uint64:
-            return TensorHandle(np_umulhi_u64(lhs.data, rhs.data), lhs.dtype.scalar)
+        bitwidth = dtype.itemsize * 8
+        unsigned_dtype = np.dtype(f"uint{bitwidth}")
+        lhs_data = lhs.data.view(unsigned_dtype)
+        rhs_data = rhs.data.view(unsigned_dtype)
+        if bitwidth == 64:
+            ret_data = np_umulhi_u64(lhs_data, rhs_data)
         else:
-            compute_dtype = getattr(np, f"uint{dtype.itemsize * 8 * 2}")
-            lhs_data = lhs.data.astype(compute_dtype)
-            rhs_data = rhs.data.astype(compute_dtype)
-            ret_data = np.multiply(lhs_data, rhs_data) >> (dtype.itemsize * 8)
-            return TensorHandle(ret_data.astype(dtype), lhs.dtype.scalar)
+            compute_dtype = np.dtype(f"uint{bitwidth * 2}")
+            ret_data = np.multiply(lhs_data.astype(compute_dtype), rhs_data.astype(compute_dtype)) >> bitwidth
+        return TensorHandle(ret_data.astype(unsigned_dtype).view(dtype), lhs.dtype.scalar)
 
     # ternary functions
     def ternary_op(self, lhs, rhs, other, op):
