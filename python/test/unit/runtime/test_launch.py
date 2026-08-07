@@ -237,3 +237,66 @@ def test_interpreter_implicit_cvt_bool() -> None:
     assert value.dtype == tl.int1
     assert value.handle.data.dtype == np.bool_
     assert bool(value.handle.data[0]) is True
+
+
+def test_interpreter_implicit_cvt_float() -> None:
+    from triton.runtime.interpreter import _implicit_cvt
+
+    value = _implicit_cvt(1.5)
+
+    assert value.dtype == tl.float32
+    assert value.handle.data.dtype == np.float32
+    assert value.handle.data[0] == np.float32(1.5)
+
+
+@pytest.mark.parametrize("annotation, triton_dtype, numpy_dtype", [
+    ("fp16", tl.float16, np.float16),
+    ("fp32", tl.float32, np.float32),
+    ("fp64", tl.float64, np.float64),
+])
+def test_interpreter_implicit_cvt_float_annotation(annotation, triton_dtype, numpy_dtype) -> None:
+    from triton.runtime.interpreter import _implicit_cvt
+
+    value = _implicit_cvt(1.5, annotation)
+
+    assert value.dtype == triton_dtype
+    assert value.handle.data.dtype == numpy_dtype
+    assert value.handle.data[0] == numpy_dtype(1.5)
+
+
+def test_interpreter_implicit_cvt_bfloat16_annotation() -> None:
+    from triton.runtime.interpreter import _implicit_cvt
+
+    value = _implicit_cvt(1.5, "bf16")
+
+    assert value.dtype == tl.bfloat16
+    assert value.handle.data.dtype == np.uint16
+    assert value.handle.data[0] == 0x3FC0
+
+
+@pytest.mark.interpreter
+def test_interpreter_runtime_float_arguments_use_fp32(device) -> None:
+
+    @triton.jit
+    def kernel(output, x, y):
+        tl.store(output, (x + y) - x)
+
+    output = torch.empty(1, dtype=torch.float32, device=device)
+    kernel[(1, )](output, 16777216.0, 1.0)
+
+    assert output.item() == 0.0
+
+
+@pytest.mark.interpreter
+def test_interpreter_runtime_float_annotation_overrides_inference(device) -> None:
+
+    @triton.jit
+    def kernel(output, x: tl.float64, y: tl.float64):
+        tl.static_assert(x.dtype == tl.float64)
+        tl.static_assert(y.dtype == tl.float64)
+        tl.store(output, (x + y) - x)
+
+    output = torch.empty(1, dtype=torch.float64, device=device)
+    kernel[(1, )](output, 16777216.0, 1.0)
+
+    assert output.item() == 1.0

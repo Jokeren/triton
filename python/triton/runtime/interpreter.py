@@ -1287,7 +1287,7 @@ def _patch_lang(fn):
 
 
 # TODO: wrap everything in triton tensors
-def _implicit_cvt(arg):
+def _implicit_cvt(arg, annotation=None):
     if isinstance(arg, bool):
         handle = TensorHandle(np.array([arg], dtype=np.bool_), tl.int1)
         return tl.tensor(handle, tl.int1)
@@ -1305,6 +1305,23 @@ def _implicit_cvt(arg):
         else:
             raise ValueError(f"Unsupported integer value {arg}")
         handle = TensorHandle(np.array([arg], dtype=dtype), ty)
+        return tl.tensor(handle, ty)
+    if isinstance(arg, float):
+        # The regular JIT defaults Python float arguments to fp32, but an
+        # explicit scalar annotation overrides type inference.
+        float_annotations = {"fp16", "bf16", "fp32", "fp64"}
+        ty_name = annotation if annotation in float_annotations else triton.runtime.jit.mangle_type(arg)
+        ty = tl.str_to_ty(ty_name, None)
+        if ty == tl.bfloat16:
+            input_bits = np.array([arg], dtype=np.float32).view(np.uint32)
+            retained_lsb = (input_bits >> 16) & 1
+            rounded_bits = input_bits + np.uint32(0x7FFF) + retained_lsb
+            data = (rounded_bits >> 16).astype(np.uint16)
+            is_nan = (input_bits & np.uint32(0x7FFFFFFF)) > np.uint32(0x7F800000)
+            data[is_nan] = ((input_bits[is_nan] >> 16) | np.uint32(0x0040)).astype(np.uint16)
+        else:
+            data = np.array([arg], dtype=_get_np_dtype(ty))
+        handle = TensorHandle(data, ty)
         return tl.tensor(handle, ty)
     if hasattr(arg, "data_ptr"):
         ty = tl.str_to_ty(triton.runtime.jit.mangle_type(arg), None)
@@ -1344,8 +1361,8 @@ class GridExecutor:
         self.arg_names = arg_names
         self.grid = grid
         self.pre_run_hooks = pre_run_hooks
-        __annotations__ = {name: _normalize_ty(ty) for name, ty in inspect.get_annotations(fn).items()}
-        self.constexprs = [name for name in arg_names if __annotations__.get(name) == "constexpr"]
+        self.annotations = {name: _normalize_ty(ty) for name, ty in inspect.get_annotations(fn).items()}
+        self.constexprs = [name for name in arg_names if self.annotations.get(name) == "constexpr"]
 
     def _init_args_hst(self, args_dev, kwargs):
         storages = {}
@@ -1426,7 +1443,10 @@ class GridExecutor:
             # we need to copy arguments to the host for the interpreter
             # implicitly convert tensor arguments to their base pointers
             args = inspect.getcallargs(self.fn, *args_hst, **kwargs_hst)
-            args = {name: arg if name in self.constexprs else _implicit_cvt(arg) for name, arg in args.items()}
+            args = {
+                name: arg if name in self.constexprs else _implicit_cvt(arg, self.annotations.get(name))
+                for name, arg in args.items()
+            }
             # iterate through grid
             grid = self.grid(args) if callable(self.grid) else self.grid
             assert len(grid) <= 3, "grid must have at most 3 dimensions"
