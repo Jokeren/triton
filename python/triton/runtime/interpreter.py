@@ -175,6 +175,22 @@ def _get_np_dtype(tt_dtype):
     return np_types[tt_dtype]
 
 
+def _get_descriptor_nan_padding_value(tt_dtype):
+    # The interpreter stores bfloat16 and float8 values as their integer bit
+    # representations, so their padding must be encoded rather than cast.
+    encoded_nan = {
+        tl.bfloat16: np.uint16(0x7FC0),
+        tl.float8e5: np.uint8(0x7F),
+        tl.float8e4nv: np.uint8(0x7F),
+        tl.float8e4b8: np.uint8(0x80),
+        tl.float8e5b16: np.uint8(0x80),
+    }
+    if tt_dtype == tl.float8e4b15:
+        # float8e4b15 has no canonical, descriptor-supported NaN encoding.
+        raise ValueError("NaN descriptor padding is unsupported for float8e4b15")
+    return encoded_nan.get(tt_dtype, float('nan'))
+
+
 def _convert_float(input, input_dtype, output_dtype, rounding_mode):
     input_uint_dtype = getattr(np, f"uint{input_dtype.primitive_bitwidth}")
     output_unint_dtype = getattr(np, f"uint{output_dtype.primitive_bitwidth}")
@@ -860,7 +876,8 @@ class InterpreterBuilder:
         if padding == _ir.PADDING_OPTION.PAD_ZERO:
             other = TensorHandle(np.zeros_like(ptrs.data, dtype=dtype_np), dtype_tt)
         elif padding == _ir.PADDING_OPTION.PAD_NAN:
-            other = TensorHandle(np.full_like(ptrs.data, float('nan'), dtype=dtype_np), dtype_tt)
+            padding_value = _get_descriptor_nan_padding_value(dtype_tt)
+            other = TensorHandle(np.full_like(ptrs.data, padding_value, dtype=dtype_np), dtype_tt)
         else:
             raise ValueError(f"unsupported padding {padding}")
         return self.create_masked_load(ptrs, mask, other, cache_modifier=cache_modifier,

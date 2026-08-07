@@ -386,7 +386,18 @@ def test_tensor_descriptor_store_nd(dtype_str, num_ctas, ndim, INNER_BLOCK, devi
 
 
 @pytest.mark.interpreter
-def test_tensor_descriptor_padding(device):
+@pytest.mark.parametrize("dtype_str,expected_nan_bits", [
+    ("float32", 0x7FC00000),
+    ("bfloat16", 0x7FC0),
+    ("float8_e5m2", 0x7F),
+    ("float8_e4m3fn", 0x7F),
+    ("float8_e4m3fnuz", 0x80),
+    ("float8_e5m2fnuz", 0x80),
+])
+def test_tensor_descriptor_padding(dtype_str, expected_nan_bits, device):
+
+    if dtype_str.startswith("float8") and not is_interpreter():
+        pytest.skip("FP8 descriptor padding is only covered by the interpreter")
 
     @triton.jit
     def device_tma_load(in_ptr, out_ptr, IM, IN, YM, YN, M_BLOCK: tl.constexpr, N_BLOCK: tl.constexpr,
@@ -426,22 +437,28 @@ def test_tensor_descriptor_padding(device):
     M_BLOCK = 32
     N_BLOCK = 32
     padding = "nan"
-    input = torch.arange(IM * IN, device=device, dtype=torch.float32)
-    input = input.reshape(IM, IN)
-    out_device_tma = torch.zeros((OM, ON), device=device, dtype=torch.float32)
-    out_host_tma = torch.zeros((OM, ON), device=device, dtype=torch.float32)
+    dtype = getattr(torch, dtype_str)
+    input = torch.arange(IM * IN, device=device, dtype=torch.float32).reshape(IM, IN).to(dtype)
+    out_device_tma = torch.zeros((OM, ON), device=device, dtype=dtype)
+    out_host_tma = torch.zeros((OM, ON), device=device, dtype=dtype)
     dummy_block = [M_BLOCK, N_BLOCK]
     in_desc = TensorDescriptor(input, input.shape, input.stride(), dummy_block, padding=padding)
     grid = (triton.cdiv(OM, M_BLOCK), triton.cdiv(ON, N_BLOCK))
     device_tma_load[grid](input, out_device_tma, IM, IN, OM, ON, M_BLOCK, N_BLOCK, padding)
     host_tma_load[grid](in_desc, out_host_tma, OM, ON, M_BLOCK, N_BLOCK)
-    expected = torch.zeros((OM, ON), device=device, dtype=torch.float32)
+    expected = torch.zeros((OM, ON), device=device, dtype=dtype)
     expected[0:IN, 0:IM] = input
     expected[:, IN:ON] = float('nan')
     expected[IM:OM, :] = float('nan')
 
     torch.testing.assert_close(expected, out_device_tma, equal_nan=True)
     torch.testing.assert_close(expected, out_host_tma, equal_nan=True)
+    if is_interpreter():
+        oob = torch.ones((OM, ON), dtype=torch.bool, device=device)
+        oob[:IM, :IN] = False
+        storage_dtype = torch.int32 if dtype == torch.float32 else torch.uint16 if dtype == torch.bfloat16 else torch.uint8
+        for actual in (out_device_tma, out_host_tma):
+            assert torch.all(actual.view(storage_dtype)[oob] == expected_nan_bits)
 
 
 @triton.jit(noinline=True)
