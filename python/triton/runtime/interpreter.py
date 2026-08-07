@@ -61,13 +61,14 @@ class TensorHandle:
 class TensorDescHandle:
 
     def __init__(self, base: TensorHandle, shape: List[TensorHandle], strides: List[TensorHandle],
-                 block_shape: List[int], padding):
+                 block_shape: List[int], padding, round_f32_to_tf32: bool = False):
         self.base = base
         self.ndim = len(shape)
         self.shape = shape
         self.strides = strides
         self.block_shape = block_shape
         self.padding = padding
+        self.round_f32_to_tf32 = round_f32_to_tf32
 
     def validate(self):
         assert self.base.data.item() % 16 == 0, "base must be 16-byte aligned"
@@ -173,6 +174,15 @@ def _get_np_dtype(tt_dtype):
             return np.dtype(np.uint64)
         return np_types[tt_dtype.element_ty]
     return np_types[tt_dtype]
+
+
+def _round_float32_to_tf32(data: np.ndarray) -> np.ndarray:
+    assert data.dtype == np.float32
+    bits = data.view(np.uint32)
+    is_special = (bits & np.uint32(0x7F800000)) == np.uint32(0x7F800000)
+    round_bias = np.uint32(0xFFF) + ((bits >> np.uint32(13)) & np.uint32(1))
+    rounded = (bits + round_bias) & np.uint32(0xFFFFE000)
+    return np.where(is_special, bits, rounded).view(np.float32)
 
 
 def _convert_float(input, input_dtype, output_dtype, rounding_mode):
@@ -863,8 +873,12 @@ class InterpreterBuilder:
             other = TensorHandle(np.full_like(ptrs.data, float('nan'), dtype=dtype_np), dtype_tt)
         else:
             raise ValueError(f"unsupported padding {padding}")
-        return self.create_masked_load(ptrs, mask, other, cache_modifier=cache_modifier,
-                                       eviction_policy=eviction_policy, is_volatile=False)
+        result = self.create_masked_load(ptrs, mask, other, cache_modifier=cache_modifier,
+                                         eviction_policy=eviction_policy, is_volatile=False)
+        if desc.round_f32_to_tf32:
+            assert dtype_tt == tl.float32
+            return TensorHandle(_round_float32_to_tf32(result.data), dtype_tt)
+        return result
 
     def create_descriptor_store(self, desc: TensorDescHandle, value: TensorHandle, indices: List[TensorHandle]):
         ptrs, mask = desc.materialize_pointers(indices)
@@ -1316,10 +1330,12 @@ def _implicit_cvt(arg):
         strides = [_implicit_cvt(s) for s in arg.strides]
         assert arg.strides[-1] == 1
         strides[-1] = tl.constexpr(1)
-        return interpreter_semantic.make_tensor_descriptor(base=_implicit_cvt(arg.base),
+        desc = interpreter_semantic.make_tensor_descriptor(base=_implicit_cvt(arg.base),
                                                            shape=[_implicit_cvt(s) for s in arg.shape], strides=strides,
                                                            block_shape=[tl.constexpr(b) for b in arg.block_shape],
                                                            padding_option=arg.padding)
+        desc.handle.round_f32_to_tf32 = arg.round_f32_to_tf32
+        return desc
     return arg
 
 

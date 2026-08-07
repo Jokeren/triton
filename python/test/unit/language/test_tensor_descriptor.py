@@ -444,6 +444,54 @@ def test_tensor_descriptor_padding(device):
     torch.testing.assert_close(expected, out_host_tma, equal_nan=True)
 
 
+@pytest.mark.interpreter
+def test_interpreter_host_descriptor_rounds_f32_to_tf32(device):
+    if not is_interpreter():
+        pytest.skip("requires the interpreter")
+
+    @triton.jit
+    def host_descriptor_load(desc, out):
+        block = desc.load([0, 0])
+        tl.store(out + tl.arange(0, 8)[None, :], block)
+
+    @triton.jit
+    def device_descriptor_load(inp, out):
+        desc = tl.make_tensor_descriptor(inp, shape=[1, 8], strides=[8, 1], block_shape=[1, 8])
+        block = desc.load([0, 0])
+        tl.store(out + tl.arange(0, 8)[None, :], block)
+
+    input_bits = np.array([
+        0x3F8016F0,
+        0x3F801000,
+        0x3F803000,
+        0x3FFFF000,
+        0xBF8016F0,
+        0x7F800000,
+        0xFF800000,
+        0x7FC01234,
+    ], dtype=np.uint32)
+    expected_bits = np.array([
+        0x3F802000,
+        0x3F800000,
+        0x3F804000,
+        0x40000000,
+        0xBF802000,
+        0x7F800000,
+        0xFF800000,
+        0x7FC01234,
+    ], dtype=np.uint32)
+    inp = torch.from_numpy(input_bits.view(np.float32).copy()).reshape(1, 8).to(device)
+    host_out = torch.empty_like(inp)
+    device_out = torch.empty_like(inp)
+    desc = TensorDescriptor.from_tensor(inp, [1, 8], round_f32_to_tf32=True)
+
+    host_descriptor_load[(1, )](desc, host_out)
+    device_descriptor_load[(1, )](inp, device_out)
+
+    np.testing.assert_array_equal(host_out.cpu().numpy().view(np.uint32), expected_bits.reshape(1, 8))
+    np.testing.assert_array_equal(device_out.cpu().numpy().view(np.uint32), input_bits.reshape(1, 8))
+
+
 @triton.jit(noinline=True)
 def tensor_descriptor_in_function_helper(out_ptr, in_ptr, M, N, M_BLOCK: tl.constexpr, N_BLOCK: tl.constexpr):
     in_desc = tl.make_tensor_descriptor(
