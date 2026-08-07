@@ -2,7 +2,7 @@ import pytest
 import torch
 import triton.language as tl
 import triton
-from triton._internal_testing import run_in_process
+from triton._internal_testing import is_interpreter, run_in_process
 
 pytestmark = pytest.mark.usefixtures("process_pool")
 
@@ -73,6 +73,58 @@ def test_device_assert(cond, mask, opt_flag, env_var, jit_flag, device):
         return
 
     assert result.exc is None, result.exc
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("jit_debug, launch_debug, env_debug, expect_debug", [
+    (True, None, False, True),
+    (True, False, False, False),
+    (False, True, False, True),
+    (True, False, True, True),
+])
+def test_interpreter_debug_options(jit_debug, launch_debug, env_debug, expect_debug, monkeypatch):
+    if not is_interpreter():
+        pytest.skip("requires the interpreter")
+
+    from triton.runtime.interpreter import InterpreterOptions, interpreter_builder
+
+    @triton.jit(debug=jit_debug)
+    def kernel():
+        pass
+
+    observed_debug = []
+    kernel.add_pre_run_hook(lambda: observed_debug.append(interpreter_builder.options.debug))
+    initial_options = InterpreterOptions(debug=not expect_debug)
+    monkeypatch.setattr(interpreter_builder, "options", initial_options)
+    kwargs = {} if launch_debug is None else {"debug": launch_debug}
+    with triton.knobs.runtime.scope():
+        monkeypatch.setenv("TRITON_DEBUG", str(int(env_debug)))
+        triton.knobs.refresh_knobs()
+        kernel[(1, )](**kwargs)
+        assert observed_debug == [expect_debug]
+        assert interpreter_builder.options is initial_options
+
+
+@pytest.mark.interpreter
+def test_interpreter_debug_enabled_device_assert(monkeypatch):
+    if not is_interpreter():
+        pytest.skip("requires the interpreter")
+
+    from triton.runtime.errors import InterpreterError
+    from triton.runtime.interpreter import InterpreterOptions, interpreter_builder
+
+    @triton.jit(debug=True)
+    def kernel():
+        tl.device_assert(False, "test")
+
+    initial_options = InterpreterOptions(debug=False)
+    monkeypatch.setattr(interpreter_builder, "options", initial_options)
+    with triton.knobs.runtime.scope():
+        monkeypatch.setenv("TRITON_DEBUG", "0")
+        triton.knobs.refresh_knobs()
+        with pytest.raises(InterpreterError):
+            kernel[(1, )]()
+        assert interpreter_builder.options is initial_options
 
 
 def test_device_assert_barrier(device):
