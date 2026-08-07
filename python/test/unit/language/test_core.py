@@ -2825,8 +2825,8 @@ reduce_configs3 = [(op, 'float32', shape, axis, False)
                    for op in ['min', 'max', 'sum', 'argmin', 'argmax']
                    for shape in reduce3d_shapes
                    for axis in [0, 1, 2]]
-invalid_config = [('sum', 'float32', (32, 32), axis, False) for axis in [2, 3]]
-negative_config = [('sum', 'float32', (32, 32), -1, False)]
+invalid_config = [('sum', 'float32', (32, 32), axis, False) for axis in [-3, 2, 3]]
+negative_config = [('sum', 'float32', (32, 32), -1, False), ('xor_sum', 'bool', (4, 32), -1, False)]
 keep_dims_2d_configs = [(op, 'float32', (32, 32), axis, True)
                         for op in ['min', 'max', 'sum', 'argmin', 'argmax']
                         for axis in [0, 1]] + [(op, 'float32', (32, 32), None, True) for op in ['min', 'max', 'sum']]
@@ -2896,7 +2896,7 @@ def test_reduce(op, dtype_str, shape, axis, keep_dims, num_ctas, device):
 
     # numpy result
     # Silence numpy error on axis out of bounds, to give triton a chance to fail
-    np_axis = axis if axis is not None and axis < len(shape) else None
+    np_axis = axis if axis is not None and -len(shape) <= axis < len(shape) else None
     if op not in ['argmin', 'argmax'] and dtype_str == 'bfloat16':
         z_dtype_str = 'float32'
         z_tri_dtype_str = 'bfloat16'
@@ -2912,7 +2912,7 @@ def test_reduce(op, dtype_str, shape, axis, keep_dims, num_ctas, device):
     BLOCK_K = 1 if len(shape) == 2 else shape[2]
     IS_3D = bool(len(shape) == 3)
     USE_I1 = dtype_str == 'bool'
-    if axis is not None and axis >= len(shape):
+    if axis is not None and not -len(shape) <= axis < len(shape):
         with pytest.raises(triton.TritonError):
             kernel[(1, )](x_tri, z_tri, BLOCK_M=shape[0], BLOCK_N=shape[1], BLOCK_K=BLOCK_K, IS_3D=IS_3D, AXIS=axis,
                           KEEP_DIMS=keep_dims, USE_I1=USE_I1, num_ctas=num_ctas)
@@ -2951,7 +2951,8 @@ scan_configs = [(op, type, shape, axis, reverse, num_warps)
                 for reverse in [True, False]
                 for shape in scan2d_shapes
                 for op in ['cumsum', 'cumprod', 'get_first_element', 'linear_recurrence', 'cummax', 'roll']]
-negative_config = [('cumsum', 'float32', (32, 32), -1, False, 4)]
+negative_config = [('cumsum', 'float32', (32, 32), -1, False, 4),
+                   ('get_first_element', 'float32', (8, 32), -1, False, 4)]
 
 
 def test_sum_dtype(device):

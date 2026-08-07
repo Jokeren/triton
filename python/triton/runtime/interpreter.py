@@ -978,7 +978,7 @@ class ReduceScanOpInterface:
         self.combine_fn = combine_fn
 
     def check_axis(self, shape, axis):
-        if axis is not None and axis >= len(shape):
+        if axis is not None and not -len(shape) <= axis < len(shape):
             raise ValueError(f"axis {axis} out of bounds for shape {shape}")
 
     def check_tensor(self, input):
@@ -986,6 +986,8 @@ class ReduceScanOpInterface:
             if not isinstance(arg, tl.core.tensor):
                 raise ValueError(f"input must be a tensor, got {type(arg)}")
             self.check_axis(arg.shape, self.axis)
+        if self.axis is not None:
+            self.axis %= len(input[0].shape)
 
     def to_tensor(self, ret, dtype):
         np_dtype = _get_np_dtype(dtype)
