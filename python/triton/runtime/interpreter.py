@@ -175,6 +175,19 @@ def _get_np_dtype(tt_dtype):
     return np_types[tt_dtype]
 
 
+def _float32_to_bfloat16_rtne(input):
+    input_bits = np.frombuffer(input.tobytes(), dtype=np.uint32)
+    retained_lsb = (input_bits >> 16) & 1
+    rounding_bias = np.uint32(0x7FFF) + retained_lsb
+    rounded_bits = np.add(input_bits, rounding_bias, dtype=np.uint32)
+    output = (rounded_bits >> 16).astype(np.uint16)
+
+    is_nan = (input_bits & np.uint32(0x7FFFFFFF)) > np.uint32(0x7F800000)
+    quiet_nan = ((input_bits >> 16) | np.uint32(0x0040)).astype(np.uint16)
+    output = np.where(is_nan, quiet_nan, output).astype(np.uint16)
+    return output.reshape(input.shape)
+
+
 def _convert_float(input, input_dtype, output_dtype, rounding_mode):
     input_uint_dtype = getattr(np, f"uint{input_dtype.primitive_bitwidth}")
     output_unint_dtype = getattr(np, f"uint{output_dtype.primitive_bitwidth}")
@@ -529,8 +542,10 @@ class InterpreterBuilder:
     def cast_impl(self, src, dst_type):
         src_element_type = src.dtype.scalar
         dst_element_type = dst_type.scalar
-        if (src_element_type == tl.bfloat16 and dst_element_type == tl.float32) or \
-           (src_element_type == tl.float32 and dst_element_type == tl.bfloat16):
+        if src_element_type == tl.float32 and dst_element_type == tl.bfloat16:
+            data = _float32_to_bfloat16_rtne(src.data)
+            return TensorHandle(data, dst_type.scalar)
+        elif src_element_type == tl.bfloat16 and dst_element_type == tl.float32:
             data = _convert_float(src.data, src_element_type, dst_element_type, None).view(_get_np_dtype(dst_type))
             return TensorHandle(data, dst_type.scalar)
         else:
