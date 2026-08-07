@@ -835,7 +835,8 @@ class InterpreterBuilder:
 
     def create_assert(self, condition, message):
         # Interpreter's device_assert function has a different format than Triton's device_assert
-        assert condition, f"{message}"
+        if not condition:
+            raise AssertionError(f"{message}")
 
     def create_assume(self, condition):
         assert condition, "Assume failed"

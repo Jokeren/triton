@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import numpy as np
 
 from triton._C.libtriton import interpreter as _interpreter
@@ -59,3 +62,22 @@ def test_atomic_cas_accepts_non_contiguous_ndarray_views() -> None:
     np.testing.assert_array_equal(old, original[:, ::2])
     original[:, ::2] = desired
     np.testing.assert_array_equal(dst, original)
+
+
+def test_create_assert_enabled_under_optimized_python() -> None:
+    message = "device assertion remains enabled"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-O",
+            "-c",
+            ("from triton.runtime.interpreter import InterpreterBuilder; "
+             "builder = InterpreterBuilder(); "
+             f"builder.create_assert(builder.get_int1(False), {message!r})"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert f"AssertionError: {message}" in result.stderr
