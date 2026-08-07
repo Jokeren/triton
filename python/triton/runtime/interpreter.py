@@ -918,28 +918,62 @@ class _LangPatchScope:
     """Tracks patched attributes so they can be restored."""
 
     def __init__(self) -> None:
-        self._changes: list[tuple[object, str, object]] = []
+        self._changes: list[tuple[str, object, str, object]] = []
 
     def set_attr(self, obj: object, name: str, value: object) -> None:
         original = getattr(obj, name, _MISSING)
-        self._changes.append((obj, name, original))
+        self._changes.append(("attr", obj, name, original))
         setattr(obj, name, value)
+
+    def set_item(self, mapping: dict, name: str, value: object) -> None:
+        original = mapping.get(name, _MISSING)
+        self._changes.append(("item", mapping, name, original))
+        mapping[name] = value
 
     def restore(self) -> None:
         while self._changes:
-            obj, name, original = self._changes.pop()
+            self._restore_change(self._changes.pop())
+
+    def restore_items(self) -> None:
+        # Direct bindings are appended after module attributes.  A nested
+        # device function must restore its own globals without undoing the
+        # language patches owned by its enclosing kernel launch.
+        while self._changes and self._changes[-1][0] == "item":
+            self._restore_change(self._changes.pop())
+
+    @staticmethod
+    def _restore_change(change) -> None:
+        kind, obj, name, original = change
+        if kind == "attr":
             if original is _MISSING:
                 delattr(obj, name)
             else:
                 setattr(obj, name, original)
+        else:
+            assert isinstance(obj, dict)
+            if original is _MISSING:
+                del obj[name]
+            else:
+                obj[name] = original
+
+
+def _patched_builtin(member):
+    return lambda *args, **kwargs: (member(*args, **{k: v
+                                                     for k, v in kwargs.items()
+                                                     if k != "_semantic"}, _semantic=interpreter_semantic))
+
+
+# Keep identities from the pristine language modules.  Nested device calls run
+# while those modules already contain interpreter wrappers, but their globals
+# can still contain the original object from a direct import.
+_ORIGINAL_LANGUAGE_MEMBERS = {}
+for _pkg in (tl, tl.core, tl.math):
+    for _name, _member in inspect.getmembers(_pkg):
+        _ORIGINAL_LANGUAGE_MEMBERS.setdefault(id(_member), (_pkg, _name, _member))
 
 
 def _patch_attr(obj, name, member, builder, scope: _LangPatchScope):
-    new_member = lambda *args, member=member, **kwargs: (member(*args, **
-                                                                {k: v
-                                                                 for k, v in kwargs.items()
-                                                                 if k != "_semantic"}, _semantic=interpreter_semantic))
-    scope.set_attr(obj, name, new_member)
+    scope.set_attr(obj, name, _patched_builtin(member))
 
 
 def _patch_builtin(pkg, builder, scope: _LangPatchScope):
@@ -1273,9 +1307,13 @@ def _patch_lang_core(lang, scope: _LangPatchScope):
 
 def _patch_lang(fn):
     scope = _LangPatchScope()
-    langs = [value for _, value in fn.__globals__.items() if inspect.ismodule(value) and value in [tl, tl.core]]
-    assert len(langs) >= 1, "triton.language must be visible from within jit'd function"
-    for lang in langs:
+    direct_bindings = []
+    for global_name, value in fn.__globals__.items():
+        binding = _ORIGINAL_LANGUAGE_MEMBERS.get(id(value))
+        if binding is not None and value is binding[2]:
+            direct_bindings.append((global_name, binding[0], binding[1]))
+
+    for lang in (tl, tl.core):
         _patch_builtin(lang, interpreter_builder, scope)
         _patch_builtin(lang.tensor, interpreter_builder, scope)
         if lang == tl:
@@ -1283,6 +1321,8 @@ def _patch_lang(fn):
         _patch_lang_tensor(lang.tensor, scope)
         _patch_lang_core(lang, scope)
     _patch_builtin(tl.core.tensor_descriptor_base, interpreter_builder, scope)
+    for global_name, pkg, member_name in direct_bindings:
+        scope.set_item(fn.__globals__, global_name, getattr(pkg, member_name))
     return scope
 
 
@@ -1568,9 +1608,12 @@ class InterpretedFunction(KernelInterface[T]):
 
     def __call__(self, *args, **kwargs):
         # This is a device function call
-        _patch_lang(self.fn)
-        fn = self.rewrite()
+        patch_scope = _patch_lang(self.fn)
         try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            raise InterpreterError(repr(e)) from e
+            fn = self.rewrite()
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                raise InterpreterError(repr(e)) from e
+        finally:
+            patch_scope.restore_items()

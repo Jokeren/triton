@@ -1,6 +1,27 @@
+import types
+
 import numpy as np
+import pytest
+import torch
+
+import triton
+import triton.language as tl
+from triton.language.core import item as direct_item
+from triton.language import static_range as direct_static_range
+from triton.language import store as direct_store
 
 from triton._C.libtriton import interpreter as _interpreter
+
+_cross_globals_helper = None
+
+
+def _cross_globals_helper_impl(output):
+    direct_store(output, direct_item(tl.arange(0, 1)) + 7)
+
+
+@triton.jit
+def _call_cross_globals_helper(output):
+    _cross_globals_helper(output)
 
 
 def _element_ptrs(array: np.ndarray) -> np.ndarray:
@@ -59,3 +80,52 @@ def test_atomic_cas_accepts_non_contiguous_ndarray_views() -> None:
     np.testing.assert_array_equal(old, original[:, ::2])
     original[:, ::2] = desired
     np.testing.assert_array_equal(dst, original)
+
+
+@pytest.mark.interpreter
+def test_directly_imported_language_builtin(device) -> None:
+
+    @triton.jit
+    def kernel(output):
+        value = 0
+        for i in direct_static_range(4):
+            value += i
+        direct_store(output, value)
+
+    original_store = direct_store
+    original_static_range = direct_static_range
+    output = torch.empty(1, dtype=torch.int32, device=device)
+    kernel[(1, )](output)
+
+    assert output.item() == 6
+    assert direct_store is original_store
+    assert direct_static_range is original_static_range
+
+
+@pytest.mark.interpreter
+def test_nested_direct_builtin_from_other_globals(device) -> None:
+    global _cross_globals_helper
+
+    helper_globals = {
+        "__builtins__": __builtins__,
+        "direct_item": direct_item,
+        "direct_store": direct_store,
+        "tl": tl,
+    }
+    helper_fn = types.FunctionType(_cross_globals_helper_impl.__code__, helper_globals,
+                                   _cross_globals_helper_impl.__name__)
+    _cross_globals_helper = triton.jit(helper_fn)
+    original_item = helper_globals["direct_item"]
+    original_store = helper_globals["direct_store"]
+
+    try:
+        output = torch.empty(1, dtype=torch.int32, device=device)
+        _call_cross_globals_helper[(1, )](output)
+
+        assert output.item() == 7
+        assert helper_globals["direct_item"] is original_item
+        assert helper_globals["direct_store"] is original_store
+    finally:
+        helper_globals["direct_item"] = original_item
+        helper_globals["direct_store"] = original_store
+        _cross_globals_helper = None
