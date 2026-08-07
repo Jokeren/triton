@@ -3568,6 +3568,56 @@ def test_trans_4d(dtype_str, shape, perm, device, with_allocator):
 # ---------------
 
 
+@pytest.mark.interpreter
+def test_interpreter_dot_input_precision(device):
+    if not is_interpreter():
+        pytest.skip("requires the interpreter")
+
+    @triton.jit
+    def kernel(a_ptr, b_ptr, out_ptr, INPUT_PRECISION: tl.constexpr):
+        offsets = tl.arange(0, 1)
+        a = tl.load(a_ptr + offsets[:, None])
+        b = tl.load(b_ptr + offsets[None, :])
+        result = tl.dot(a, b, input_precision=INPUT_PRECISION)
+        tl.store(out_ptr + offsets[:, None], result)
+
+    out = torch.empty((1, 1), dtype=torch.float32, device=device)
+
+    def run(input_bits, precision, other_bits=0x3F800000):
+        a = torch.from_numpy(np.array([input_bits], dtype=np.uint32).view(np.float32).copy()).reshape(1, 1).to(device)
+        b = torch.from_numpy(np.array([other_bits], dtype=np.uint32).view(np.float32).copy()).reshape(1, 1).to(device)
+        kernel[(1, )](a, b, out, precision)
+        return out.cpu().numpy().copy()
+
+    expected_bits = {
+        "ieee": 0x3F8016F0,
+        "tf32": 0x3F800000,
+        "tf32x3": 0x3F8016F0,
+    }
+
+    for precision, expected in expected_bits.items():
+        assert run(0x3F8016F0, precision).view(np.uint32).item() == expected
+
+    truncation_cases = {
+        0x3F801000: 0x3F800000,
+        0x3F803000: 0x3F802000,
+        0x3FFFF000: 0x3FFFE000,
+    }
+    for input_bits, expected in truncation_cases.items():
+        assert run(input_bits, "tf32").view(np.uint32).item() == expected
+
+    # TF32x3 uses cvt.rna.tf32.f32 for its split.  The first operands round
+    # from 0x[3/b]c001000 to 0x[3/b]c002000; ties-to-even would choose
+    # 0x[3/b]c000000 and produce results ending in 0x008 instead of 0x004.
+    assert run(0x3C001000, "tf32x3", 0x3C003000).view(np.uint32).item() == 0x38804004
+    assert run(0xBC001000, "tf32x3", 0x3C003000).view(np.uint32).item() == 0xB8804004
+
+    # Truncation must not erase a payload that is wholly below TF32 precision
+    # and silently turn a signaling NaN into infinity.
+    assert np.isnan(run(0x7F800001, "tf32")).all()
+    assert np.isposinf(run(0x7F800000, "tf32")).all()
+
+
 def convert_fp8_to_fp32(x, device, dtype_str):
     if dtype_str == 'float8e4nv':
         return torch.tensor(x, device=device).view(torch.float8_e4m3fn).to(torch.float32)

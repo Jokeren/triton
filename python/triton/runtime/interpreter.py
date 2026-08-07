@@ -175,6 +175,30 @@ def _get_np_dtype(tt_dtype):
     return np_types[tt_dtype]
 
 
+def _truncate_float32_to_tf32(data: np.ndarray) -> np.ndarray:
+    assert data.dtype == np.float32
+    bits = data.view(np.uint32)
+    # Plain TF32 dots lower directly to mma.sync with TF32 operands.  Triton's
+    # language contract documents that finite values on this path can discard
+    # the low 13 bits without rounding.  Preserve every NaN/Inf bit pattern so
+    # a NaN whose payload lies entirely in those low bits cannot become Inf in
+    # NumPy's float32 matmul.
+    is_special = (bits & np.uint32(0x7F800000)) == np.uint32(0x7F800000)
+    truncated = bits & np.uint32(0xFFFFE000)
+    return np.where(is_special, bits, truncated).view(np.float32)
+
+
+def _round_float32_to_tf32_rna(data: np.ndarray) -> np.ndarray:
+    assert data.dtype == np.float32
+    bits = data.view(np.uint32)
+    is_special = (bits & np.uint32(0x7F800000)) == np.uint32(0x7F800000)
+    # F32DotTC.cpp emits cvt.rna.tf32.f32 for the TF32x3 split.  Adding half
+    # an ulp before truncation implements nearest with ties away from zero for
+    # both signs because IEEE float32 stores sign and magnitude separately.
+    rounded = (bits + np.uint32(0x1000)) & np.uint32(0xFFFFE000)
+    return np.where(is_special, bits, rounded).view(np.float32)
+
+
 def _convert_float(input, input_dtype, output_dtype, rounding_mode):
     input_uint_dtype = getattr(np, f"uint{input_dtype.primitive_bitwidth}")
     output_unint_dtype = getattr(np, f"uint{output_dtype.primitive_bitwidth}")
@@ -715,6 +739,22 @@ class InterpreterBuilder:
     def create_dot(self, a, b, d, input_precision, max_num_imprecise_acc):
         a_data = a.data
         b_data = b.data
+        if a.dtype == tl.float32 and b.dtype == tl.float32:
+            if input_precision == _ir.INPUT_PRECISION.TF32:
+                a_data = _truncate_float32_to_tf32(a_data)
+                b_data = _truncate_float32_to_tf32(b_data)
+            elif input_precision == _ir.INPUT_PRECISION.TF32x3:
+                a_big = _round_float32_to_tf32_rna(a_data)
+                b_big = _round_float32_to_tf32_rna(b_data)
+                # The residual products are ordinary TF32 dot operations in
+                # F32DotTC.cpp, so they follow the target's truncating path.
+                a_small = _truncate_float32_to_tf32(a_data - a_big)
+                b_small = _truncate_float32_to_tf32(b_data - b_big)
+                partial = np.matmul(a_small, b_big, dtype=d.data.dtype)
+                partial = np.matmul(a_big, b_small, dtype=d.data.dtype) + partial
+                partial = np.where(np.isnan(partial), np.float32(0), partial)
+                result = np.matmul(a_big, b_big, dtype=d.data.dtype) + partial + d.data
+                return TensorHandle(result, d.dtype.scalar)
         if (a.dtype.primitive_bitwidth == 8 and a.dtype.is_floating()) or \
            (b.dtype.primitive_bitwidth == 8 and b.dtype.is_floating()):
             a_data = _convert_float(a_data, a.dtype, tl.float16, None).view(np.float16)
