@@ -1568,9 +1568,12 @@ class InterpretedFunction(KernelInterface[T]):
 
     def __call__(self, *args, **kwargs):
         # This is a device function call
-        _patch_lang(self.fn)
-        fn = self.rewrite()
+        patch_scope = _patch_lang(self.fn)
         try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            raise InterpreterError(repr(e)) from e
+            fn = self.rewrite()
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                raise InterpreterError(repr(e)) from e
+        finally:
+            patch_scope.restore()
