@@ -2,6 +2,7 @@ from __future__ import annotations
 import ast
 import textwrap
 import inspect
+import types
 from typing import Tuple, List, Dict, Callable, TypeVar, Optional
 
 import math
@@ -1459,7 +1460,7 @@ class ASTTransformer(ast.NodeTransformer):
         # Modify the assignment x = value to
         # interpreter_semantic.to_tensor(value, False)
         node.value = ast.Call(
-            func=ast.Attribute(value=ast.Name(id="interpreter_semantic", ctx=ast.Load()), attr="to_tensor",
+            func=ast.Attribute(value=ast.Name(id="__triton_interpreter_semantic", ctx=ast.Load()), attr="to_tensor",
                                ctx=ast.Load()), args=[node.value, ast.Constant(value=False)], keywords=[])
         return node
 
@@ -1524,14 +1525,37 @@ class FunctionRewriter:
         return transformed_ast
 
     def _compile_and_exec(self, transformed_ast):
+        closure_vars = inspect.getclosurevars(self.fn)
+        captured_values = {**closure_vars.nonlocals, "__triton_interpreter_semantic": interpreter_semantic}
+        function_def = next(node for node in transformed_ast.body
+                            if isinstance(node, ast.FunctionDef) and node.name == self.fn.__name__)
+
+        # Recompiling a nested function at module scope turns its free-variable
+        # reads into global reads.  Make those names parameters with captured
+        # defaults instead.  The rewritten function can then keep the original
+        # module globals, so later module-level rebindings remain visible.
+        capture_globals = {}
+        for index, (name, value) in enumerate(captured_values.items()):
+            default_name = f"__triton_interpreter_capture_{index}"
+            function_def.args.kwonlyargs.append(ast.arg(arg=name))
+            function_def.args.kw_defaults.append(ast.Name(id=default_name, ctx=ast.Load()))
+            capture_globals[default_name] = value
+        ast.fix_missing_locations(transformed_ast)
+
         compiled_code = compile(transformed_ast, filename=self.filename, mode='exec')
         local_namespace = {**self.kwargs}
-        fn_globals = self.fn.__globals__
-        for key, value in globals().items():
-            if key not in fn_globals:
-                fn_globals[key] = value
-        exec(compiled_code, fn_globals, local_namespace)
-        return local_namespace[self.fn.__name__]
+        exec_globals = {**globals(), **self.fn.__globals__, **capture_globals}
+        exec(compiled_code, exec_globals, local_namespace)
+        rewritten_fn = local_namespace[self.fn.__name__]
+        live_fn = types.FunctionType(rewritten_fn.__code__, self.fn.__globals__, rewritten_fn.__name__,
+                                     rewritten_fn.__defaults__, rewritten_fn.__closure__)
+        live_fn.__kwdefaults__ = rewritten_fn.__kwdefaults__
+        live_fn.__annotations__ = rewritten_fn.__annotations__
+        live_fn.__dict__.update(rewritten_fn.__dict__)
+        live_fn.__doc__ = rewritten_fn.__doc__
+        live_fn.__module__ = rewritten_fn.__module__
+        live_fn.__qualname__ = rewritten_fn.__qualname__
+        return live_fn
 
 
 class InterpretedFunction(KernelInterface[T]):

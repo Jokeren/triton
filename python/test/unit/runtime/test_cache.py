@@ -540,6 +540,63 @@ def test_cache_closure():
 
 
 @triton.jit
+def _closure_helper(value, increment):
+    return value + increment
+
+
+_interpreter_rebound_global = 0
+
+
+@triton.jit
+def _read_interpreter_rebound_global(output):
+    tl.store(output, _interpreter_rebound_global)
+
+
+@pytest.mark.interpreter
+def test_interpreter_closure_nonlocals(device):
+
+    def make_closure(block_size, increment, helper):
+
+        @triton.jit
+        def closure(output):
+            offsets = tl.arange(0, block_size)
+            values = helper(offsets, increment)
+            tl.store(output + offsets, values)
+
+        return closure
+
+    block_size = tl.constexpr(8)
+    increment = 3
+    closure = make_closure(block_size, increment, _closure_helper)
+    output = torch.empty(block_size.value, dtype=torch.int32, device=device)
+    global_names = set(closure.fn.__globals__)
+
+    closure[(1, )](output)
+
+    expected = torch.arange(block_size.value, dtype=torch.int32, device=device) + increment
+    torch.testing.assert_close(output, expected)
+    assert set(closure.fn.__globals__) == global_names
+
+
+@pytest.mark.interpreter
+def test_interpreter_rewritten_function_observes_rebound_global(device):
+    global _interpreter_rebound_global
+
+    original_value = _interpreter_rebound_global
+    output = torch.empty(1, dtype=torch.int32, device=device)
+    try:
+        _interpreter_rebound_global = 11
+        _read_interpreter_rebound_global[(1, )](output)
+        assert output.item() == 11
+
+        _interpreter_rebound_global = 29
+        _read_interpreter_rebound_global[(1, )](output)
+        assert output.item() == 29
+    finally:
+        _interpreter_rebound_global = original_value
+
+
+@triton.jit
 def no_cache_callable_inner():
     pass
 
