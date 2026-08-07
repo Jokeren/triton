@@ -825,13 +825,14 @@ class InterpreterBuilder:
                 if isinstance(x, np.floating):
                     return float(x).hex()
                 width = x.dtype.itemsize * 2
-                return f"0x{int(x):0{width}x}"
+                unsigned = int(x) & ((1 << (x.dtype.itemsize * 8)) - 1)
+                return f"0x{unsigned:0{width}x}"
 
-            np.set_printoptions(formatter={'all': _to_hex})
+            formatter = {'all': _to_hex}
+        else:
+            formatter = None
         for value in values:
-            print(msg + f" {value.data}")
-        if hex:
-            np.set_printoptions(formatter=None)
+            print(msg + f" {np.array2string(value.data, formatter=formatter)}")
 
     def create_assert(self, condition, message):
         # Interpreter's device_assert function has a different format than Triton's device_assert

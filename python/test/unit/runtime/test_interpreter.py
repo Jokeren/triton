@@ -1,6 +1,8 @@
 import numpy as np
+import triton.language as tl
 
 from triton._C.libtriton import interpreter as _interpreter
+from triton.runtime.interpreter import InterpreterBuilder, TensorHandle
 
 
 def _element_ptrs(array: np.ndarray) -> np.ndarray:
@@ -59,3 +61,17 @@ def test_atomic_cas_accepts_non_contiguous_ndarray_views() -> None:
     np.testing.assert_array_equal(old, original[:, ::2])
     original[:, ::2] = desired
     np.testing.assert_array_equal(dst, original)
+
+
+def test_device_print_hex_preserves_signed_bits_and_numpy_options(capsys) -> None:
+    builder = InterpreterBuilder()
+    builder.set_grid_dim(1, 1, 1)
+    builder.set_grid_idx(0, 0, 0)
+    value = TensorHandle(np.array([-1, 1], dtype=np.int32), tl.int32)
+    custom_formatter = {'all': lambda x: f"custom({x})"}
+
+    with np.printoptions(formatter=custom_formatter):
+        builder.create_print("values:", True, [value], [True])
+        assert np.get_printoptions()['formatter'] is custom_formatter
+
+    assert capsys.readouterr().out == "(0, 0, 0) values: [0xffffffff 0x00000001]\n"
