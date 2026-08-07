@@ -1450,6 +1450,15 @@ class GridExecutor:
 
 class ASTTransformer(ast.NodeTransformer):
 
+    def visit_Assert(self, node):
+        condition = ast.Call(
+            func=ast.Attribute(value=ast.Name(id="interpreter_semantic", ctx=ast.Load()), attr="to_tensor",
+                               ctx=ast.Load()), args=[self.visit(node.test)], keywords=[])
+        message = self.visit(node.msg) if node.msg is not None else ast.Constant(value="")
+        return ast.Expr(value=ast.Call(
+            func=ast.Attribute(value=ast.Name(id="interpreter_semantic", ctx=ast.Load()), attr="device_assert",
+                               ctx=ast.Load()), args=[condition, message, ast.Constant(value=None)], keywords=[]))
+
     def visit_Assign(self, node):
         names = []
         for target in node.targets:

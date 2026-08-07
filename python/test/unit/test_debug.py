@@ -2,7 +2,7 @@ import pytest
 import torch
 import triton.language as tl
 import triton
-from triton._internal_testing import run_in_process
+from triton._internal_testing import is_interpreter, run_in_process
 
 pytestmark = pytest.mark.usefixtures("process_pool")
 
@@ -73,6 +73,32 @@ def test_device_assert(cond, mask, opt_flag, env_var, jit_flag, device):
         return
 
     assert result.exc is None, result.exc
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("debug", [False, True])
+def test_interpreter_python_assert_respects_debug(debug, device):
+    if not is_interpreter():
+        pytest.skip("requires the interpreter")
+
+    from triton.runtime.errors import InterpreterError
+    from triton.runtime.interpreter import InterpreterOptions, interpreter_builder
+
+    @triton.jit
+    def kernel(condition):
+        assert tl.load(condition) == 1, "test"
+
+    condition = torch.zeros(1, dtype=torch.int32, device=device)
+    original_options = interpreter_builder.options
+    interpreter_builder.options = InterpreterOptions(debug=debug)
+    try:
+        if debug:
+            with pytest.raises(InterpreterError):
+                kernel[(1, )](condition)
+        else:
+            kernel[(1, )](condition)
+    finally:
+        interpreter_builder.options = original_options
 
 
 def test_device_assert_barrier(device):
