@@ -5798,6 +5798,44 @@ def test_if_else(device):
 
 
 @pytest.mark.interpreter
+@pytest.mark.parametrize("condition", [False, True])
+def test_interpreter_one_element_tensor_condition(condition, device):
+    if not is_interpreter():
+        pytest.skip("requires the interpreter")
+
+    @triton.jit
+    def kernel(Cond, Out):
+        block_condition = tl.load(Cond + tl.arange(0, 1))
+        if block_condition:
+            value = 1
+        else:
+            value = 2
+        tl.store(Out, value)
+
+    cond = to_triton(np.array([condition], dtype=np.bool_), device=device)
+    out = to_triton(np.zeros(1, dtype=np.int32), device=device)
+
+    kernel[(1, )](cond, out)
+
+    assert to_numpy(out)[0] == (1 if condition else 2)
+
+
+@pytest.mark.interpreter
+def test_interpreter_multi_element_tensor_condition_is_ambiguous(device):
+    if not is_interpreter():
+        pytest.skip("requires the interpreter")
+
+    @triton.jit
+    def kernel(Out):
+        if tl.arange(0, 2) < 1:
+            tl.store(Out, 1)
+
+    out = to_triton(np.zeros(1, dtype=np.int32), device=device)
+    with pytest.raises(InterpreterError, match="Boolean value of Tensor with more than one value is ambiguous"):
+        kernel[(1, )](out)
+
+
+@pytest.mark.interpreter
 @pytest.mark.parametrize("mode", ["dynamic", "static"])
 def test_if_return(mode, device):
 

@@ -954,7 +954,9 @@ def _patch_lang_tensor(tensor, scope: _LangPatchScope):
         data = self.handle.data
         # in triton, only scalars can be converted to booleans
         # here we need this hack because all scalars are tensors
-        return bool(data) if data.size == 1 else True
+        if data.size != 1:
+            raise ValueError("Boolean value of Tensor with more than one value is ambiguous")
+        return bool(data)
 
     def _get_transpose(self):
         handle = TensorHandle(np.transpose(self.handle.data), self.handle.dtype)
