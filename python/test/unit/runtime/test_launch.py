@@ -229,6 +229,20 @@ def test_pre_run_hooks(device):
     assert torch.all(a == 2)
 
 
+@pytest.mark.interpreter
+def test_interpreter_accepts_list_grid(device):
+
+    @triton.jit
+    def kernel(output):
+        pid = tl.program_id(0)
+        tl.store(output + pid, pid)
+
+    output = torch.empty(4, dtype=torch.int32, device=device)
+    kernel[[4]](output)
+
+    torch.testing.assert_close(output, torch.arange(4, dtype=torch.int32, device=device))
+
+
 def test_interpreter_implicit_cvt_bool() -> None:
     from triton.runtime.interpreter import _implicit_cvt
 
