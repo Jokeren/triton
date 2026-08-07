@@ -175,68 +175,141 @@ def _get_np_dtype(tt_dtype):
     return np_types[tt_dtype]
 
 
+def _float_format_kind(dtype):
+    if dtype.name in ("fp8e5", "fp16", "bf16", "fp32", "fp64"):
+        return "ieee"
+    if dtype.name == "fp8e4nv":
+        return "e4m3fn"
+    if dtype.name == "fp8e4b15":
+        return "e4m3b15"
+    assert dtype.name in ("fp8e4b8", "fp8e5b16")
+    return "fnuz"
+
+
+def _decode_float(input, dtype):
+    bitwidth = dtype.primitive_bitwidth
+    mantissa_width = dtype.fp_mantissa_width
+    exponent_width = bitwidth - mantissa_width - 1
+    exponent_mask = (1 << exponent_width) - 1
+    mantissa_mask = (1 << mantissa_width) - 1
+    uint_dtype = getattr(np, f"uint{bitwidth}")
+    bits = np.frombuffer(input.tobytes(), dtype=uint_dtype).reshape(input.shape)
+    sign = (bits >> (bitwidth - 1)) != 0
+    exponent = ((bits >> mantissa_width) & exponent_mask).astype(np.int32)
+    mantissa = bits & mantissa_mask
+
+    kind = _float_format_kind(dtype)
+    if kind == "ieee":
+        nan_mask = (exponent == exponent_mask) & (mantissa != 0)
+        inf_mask = (exponent == exponent_mask) & (mantissa == 0)
+    elif kind == "e4m3fn":
+        nan_mask = (exponent == exponent_mask) & (mantissa == mantissa_mask)
+        inf_mask = np.zeros_like(nan_mask)
+    elif kind == "e4m3b15":
+        # convert_fp8e4b15_to_float16 in the CUDA language helpers treats
+        # 0x7f/0xff as aliases for the canonical maximum finite values
+        # 0x7e/0xfe, rather than as NaNs.
+        mantissa = np.where((exponent == exponent_mask) & (mantissa == mantissa_mask), mantissa_mask - 1, mantissa)
+        nan_mask = np.zeros_like(exponent, dtype=np.bool_)
+        inf_mask = np.zeros_like(nan_mask)
+    else:
+        nan_mask = bits == (1 << (bitwidth - 1))
+        inf_mask = np.zeros_like(nan_mask)
+
+    zero_mask = (exponent == 0) & (mantissa == 0) & ~nan_mask
+    subnormal_mask = (exponent == 0) & (mantissa != 0)
+    normal_mask = ~(nan_mask | inf_mask | zero_mask | subnormal_mask)
+    value = np.zeros(input.shape, dtype=np.float64)
+    value[subnormal_mask] = np.ldexp(mantissa[subnormal_mask].astype(np.float64),
+                                     1 - dtype.exponent_bias - mantissa_width)
+    value[normal_mask] = np.ldexp((mantissa[normal_mask] + (1 << mantissa_width)).astype(np.float64),
+                                  exponent[normal_mask] - dtype.exponent_bias - mantissa_width)
+    value[inf_mask] = np.inf
+    value[nan_mask] = np.nan
+    return np.where(sign, -value, value)
+
+
+def _encode_float(value, dtype, rounding_mode):
+    if rounding_mode not in (None, _ir.ROUNDING_MODE.RTNE, _ir.ROUNDING_MODE.RTZ):
+        raise ValueError(f"unsupported rounding mode {rounding_mode}")
+
+    bitwidth = dtype.primitive_bitwidth
+    mantissa_width = dtype.fp_mantissa_width
+    exponent_width = bitwidth - mantissa_width - 1
+    exponent_mask = (1 << exponent_width) - 1
+    mantissa_mask = (1 << mantissa_width) - 1
+    sign_bit = 1 << (bitwidth - 1)
+    kind = _float_format_kind(dtype)
+    if kind == "ieee":
+        max_finite = ((exponent_mask - 1) << mantissa_width) | mantissa_mask
+        overflow = exponent_mask << mantissa_width
+        nan = overflow | (mantissa_mask if dtype.name == "fp8e5" else (1 << (mantissa_width - 1)))
+    elif kind == "e4m3fn":
+        max_finite = (exponent_mask << mantissa_width) | (mantissa_mask - 1)
+        overflow = (exponent_mask << mantissa_width) | mantissa_mask
+        nan = overflow
+    elif kind == "e4m3b15":
+        # convert_float16_to_fp8e4b15 in the CUDA language helpers clamps
+        # magnitudes to 1.75, whose canonical encodings are 0x7e/0xfe.
+        # 0x7f/0xff only occur as non-canonical input aliases, and 0x80 remains
+        # negative zero.
+        max_finite = (exponent_mask << mantissa_width) | (mantissa_mask - 1)
+        overflow = max_finite
+        nan = max_finite
+    else:
+        max_finite = (exponent_mask << mantissa_width) | mantissa_mask
+        overflow = sign_bit
+        nan = sign_bit
+
+    value = np.asarray(value, dtype=np.float64)
+    abs_value = np.abs(value)
+    sign = np.signbit(value)
+    finite_mask = np.isfinite(value)
+    nonzero_mask = finite_mask & (abs_value != 0)
+    min_normal = math.ldexp(1.0, 1 - dtype.exponent_bias)
+    subnormal_mask = nonzero_mask & (abs_value < min_normal)
+    normal_mask = nonzero_mask & ~subnormal_mask
+    result = np.zeros(value.shape, dtype=np.uint64)
+    round_value = np.rint if rounding_mode == _ir.ROUNDING_MODE.RTNE else np.floor
+
+    if np.any(subnormal_mask):
+        scaled = np.ldexp(abs_value[subnormal_mask], dtype.exponent_bias + mantissa_width - 1)
+        rounded = round_value(scaled).astype(np.uint64)
+        # Rounding the largest subnormal up produces the smallest normal.
+        result[subnormal_mask] = rounded
+
+    if np.any(normal_mask):
+        significand, exponent = np.frexp(abs_value[normal_mask])
+        rounded = round_value(np.ldexp(significand, mantissa_width + 1)).astype(np.uint64)
+        carry = rounded == (1 << (mantissa_width + 1))
+        rounded[carry] >>= 1
+        encoded_exponent = exponent.astype(np.int64) - 1 + dtype.exponent_bias + carry.astype(np.int64)
+        encoded = (encoded_exponent.astype(np.uint64) << mantissa_width) | (rounded - (1 << mantissa_width))
+        overflow_mask = encoded > max_finite
+        encoded[overflow_mask] = max_finite if rounding_mode != _ir.ROUNDING_MODE.RTNE else overflow
+        result[normal_mask] = encoded
+
+    if kind == "fnuz":
+        signed_mask = finite_mask & (result != 0) & (result != overflow)
+    else:
+        signed_mask = finite_mask
+    result[signed_mask & sign] |= sign_bit
+
+    inf_mask = np.isinf(value)
+    if np.any(inf_mask):
+        result[inf_mask] = (exponent_mask << mantissa_width) if kind == "ieee" else nan
+        if kind != "fnuz":
+            result[inf_mask & sign] |= sign_bit
+    nan_mask = np.isnan(value)
+    result[nan_mask] = nan
+    if kind != "fnuz":
+        result[nan_mask & sign] |= sign_bit
+    output_uint_dtype = getattr(np, f"uint{bitwidth}")
+    return result.astype(output_uint_dtype)
+
+
 def _convert_float(input, input_dtype, output_dtype, rounding_mode):
-    input_uint_dtype = getattr(np, f"uint{input_dtype.primitive_bitwidth}")
-    output_unint_dtype = getattr(np, f"uint{output_dtype.primitive_bitwidth}")
-    input_bin = np.frombuffer(input.tobytes(), dtype=input_uint_dtype)
-    sign = (input_bin >> (input_dtype.primitive_bitwidth - 1)) & 0x01
-    input_exponent_width = input_dtype.primitive_bitwidth - input_dtype.fp_mantissa_width - 1
-    output_exponent_width = output_dtype.primitive_bitwidth - output_dtype.fp_mantissa_width - 1
-    significand = input_bin & ((1 << input_dtype.fp_mantissa_width) - 1)
-    bias_input = input_dtype.exponent_bias
-    bias_output = output_dtype.exponent_bias
-    exponent = ((input_bin >> input_dtype.fp_mantissa_width) & ((1 << input_exponent_width) - 1)).astype(np.int32)
-    subnormal_index = exponent == 0
-    if np.any(subnormal_index):
-        # Credit to Phil: phil@openai.com
-        # subnormal repr: ((-1.0)**sign) * (2.0**(1 - exp_bias)) * (2^(m0) + 2^(m1) + ... + 2^(mn))
-        # where m0, m1, ..., mn are the 1-bit of the mantissa
-        # convert it to normal repr: ((-1.0)**sign) * (2.0**(1 + m0 - exp_bias)) * (1 + 2^(m1 - m0) + ... + 2^(mn - m0))
-        bit_pos = np.zeros_like(input_bin, dtype=np.int32)
-        # Find the most significant bit of the mantissa in the significand
-        for i in range(input_dtype.fp_mantissa_width):
-            bit_index = ((significand >> i) & 0x01)
-            # pos should be >= 1
-            bit_pos[bit_index == 1] = input_dtype.fp_mantissa_width - i
-        zero_significand_index = significand == 0
-        exponent[subnormal_index] = 1 - bit_pos[subnormal_index]
-        # 0 significand and subnormal should be treated as 0
-        exponent[zero_significand_index & subnormal_index] = bias_input - bias_output
-        significand[subnormal_index] = (significand[subnormal_index] << bit_pos[subnormal_index]) & (
-            (1 << input_dtype.fp_mantissa_width) - 1)
-    # Prevent overflow and underflow
-    exponent_output = np.maximum(0, np.minimum((exponent - bias_input + bias_output), (1 << output_exponent_width) - 1))
-    exponent_output = exponent_output.astype(output_unint_dtype)
-    sign_output = sign.astype(output_unint_dtype)
-    if input_dtype.primitive_bitwidth > output_dtype.primitive_bitwidth:  # Downcast
-        significand_output = (significand >> (input_dtype.fp_mantissa_width - output_dtype.fp_mantissa_width)) & (
-            (1 << output_dtype.fp_mantissa_width) - 1)
-        if rounding_mode == _ir.ROUNDING_MODE.RTNE:  # Round to nearst even
-            # find the cut-off bit
-            cut_off = significand & (1 << (input_dtype.fp_mantissa_width - output_dtype.fp_mantissa_width - 1))
-            significand_output = significand_output + (cut_off > 0)
-        significand_output = significand_output.astype(output_unint_dtype)
-    else:  # Upcast
-        significand_output = (significand.astype(output_unint_dtype) <<
-                              (output_dtype.fp_mantissa_width - input_dtype.fp_mantissa_width)) & (
-                                  (1 << output_dtype.fp_mantissa_width) - 1)
-    subnormal_index = exponent_output == 0
-    if np.any(subnormal_index):  # underflow
-        # normal repr: ((-1.0)**sign) * (2.0**(exp - exp_bias_input)) * (1 + 2^(m0) + 2^(m1) + ... + 2^(mn))
-        # where m0, m1, ..., mn are the 1-bit of the mantissa
-        # shift = (1 - exp_bias_output) - (exp - exp_bias_input)
-        # convert it to subnormal repr: ((-1.0)**sign) * (2.0**(1 - exp_bias_output)) * (2^(-shift) + 2^(m0 - shift) + 2^(m1 - shift) + ... + 2^(mn - shift))
-        exponent = ((input_bin >> input_dtype.fp_mantissa_width) & ((1 << input_exponent_width) - 1)).astype(np.int32)
-        non_zero_exponent_index = exponent != 0
-        # If the original exponent is not zero, we still need to shift the significand and consider the 1.0 part in mantissa
-        subnormal_index = subnormal_index & non_zero_exponent_index
-        shift = np.zeros_like(input_bin, dtype=np.int32)
-        shift[subnormal_index] = (1 - bias_output) - (exponent[subnormal_index] - bias_input)
-        significand_output[subnormal_index] = (significand_output[subnormal_index] >> shift[subnormal_index]) | (
-            1 << (output_dtype.fp_mantissa_width - shift[subnormal_index]))
-    output = (sign_output << (output_dtype.primitive_bitwidth - 1)) | (
-        exponent_output << output_dtype.fp_mantissa_width) | significand_output
-    return output.reshape(input.shape)
+    return _encode_float(_decode_float(input, input_dtype), output_dtype, rounding_mode)
 
 
 def _erf(x):
@@ -253,10 +326,11 @@ def _umulhi_64(a, b):
 def _e8m0_to_f32(scale):
     assert scale.dtype in (np.uint8, np.int8)
     scale = scale.astype(np.uint8)
-    scale = scale.astype(np.int32)
-    scale = scale << 23
-    scale = scale.view(np.float32)
-    return scale
+    nan_mask = scale == np.uint8(0xFF)
+    exponent = scale.astype(np.int32) - 127
+    exponent = np.where(nan_mask, 0, exponent)
+    value = np.ldexp(np.ones(scale.shape, dtype=np.float32), exponent)
+    return np.where(nan_mask, np.float32("nan"), value)
 
 
 def _e2m1_to_f32(value):
