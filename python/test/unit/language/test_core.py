@@ -3465,6 +3465,44 @@ def test_histogram(M, N, device):
         assert "ATOMS.POPC.INC" in h.asm["sass"]
 
 
+@pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,
+                    reason="num_ctas > 1 requires NVIDIA SM90+ (Hopper)")
+@pytest.mark.parametrize("input_kind", ["load", "if", "select"])
+def test_histogram_multicta_input(input_kind, device):
+
+    @triton.jit
+    def kernel(X, Y, Condition, Out, M: tl.constexpr, N: tl.constexpr, INPUT_KIND: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = tl.arange(0, M)
+        if INPUT_KIND == "if":
+            if tl.load(Condition + pid):
+                x = tl.load(X + offsets)
+            else:
+                x = tl.load(Y + offsets)
+        else:
+            x = tl.load(X + offsets)
+            if INPUT_KIND == "select":
+                y = tl.load(Y + offsets)
+                x = tl.where(x < N // 2, x, y)
+        hist = tl.histogram(x, N)
+        tl.store(Out + pid * N + tl.arange(0, N), hist)
+
+    torch.manual_seed(17)
+    m, n = 2048, 512
+    x = torch.randint(0, n, (m, ), device=device, dtype=torch.int32)
+    y = torch.randint(0, n, (m, ), device=device, dtype=torch.int32)
+    # Exercise both runtime branches in separate logical programs.
+    condition = torch.tensor([True, False], device=device)
+    out = torch.empty((2, n), device=device, dtype=torch.int32)
+    selected = torch.where(x < n // 2, x, y) if input_kind == "select" else x
+    ref0 = torch.bincount(selected, minlength=n)
+    ref1 = torch.bincount(y, minlength=n) if input_kind == "if" else ref0
+    expected = torch.stack((ref0, ref1)).to(torch.int32)
+
+    kernel[(2, )](x, y, condition, out, m, n, input_kind, num_ctas=4)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
 @pytest.mark.interpreter
 def test_histogram_silent_data_corruption(device):
 
